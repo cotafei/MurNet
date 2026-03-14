@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MURNET CLI v5.1 - PRODUCTION READY
-Полноценное приложение для управления Murnet узлом
+MURNET CLI v5.1 - INTERACTIVE SHELL
+Полноценная командная оболочка для управления Murnet узлом
+Запускает узел и предоставляет интерактивный доступ к нему
 """
 
 import argparse
@@ -13,8 +14,10 @@ import json
 import time
 import threading
 import queue
+import cmd
+import shlex
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -33,64 +36,800 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich.layout import Layout
-    from rich.live import Live
+    from rich.tree import Tree
     from rich.progress import Progress, SpinnerColumn, TextColumn
-    from rich.prompt import Prompt, Confirm
     from rich import box
     from rich.text import Text
-    from rich.align import Align
-    from rich.tree import Tree
+    from rich.syntax import Syntax
+    from rich.live import Live
+    from rich.layout import Layout
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
 
 try:
-    from prompt_toolkit import prompt as pt_prompt
-    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.shortcuts import confirm
     HAS_PROMPT_TOOLKIT = True
+    
+    # Определяем Completer только если prompt_toolkit доступен
+    class MurnetCompleter(Completer):
+        """Автодополнение команд"""
+        
+        COMMANDS = [
+            'help', 'quit', 'exit', 'status', 'peers', 'connect', 'disconnect',
+            'send', 'chat', 'broadcast', 'dht', 'routes', 'storage', 'config',
+            'identity', 'logs', 'clear', 'shell', 'restart', 'stop', 'start',
+            'api', 'debug', 'export', 'import_key'
+        ]
+        
+        def __init__(self, cli):
+            self.cli = cli
+        
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            words = text.split()
+            
+            if not words or (len(words) == 1 and not text.endswith(' ')):
+                # Дополняем команды
+                for cmd in self.COMMANDS:
+                    if cmd.startswith(text.lower()):
+                        yield Completion(cmd, start_position=-len(text))
+            else:
+                cmd = words[0].lower()
+                
+                if cmd in ['connect', 'disconnect'] and len(words) <= 2:
+                    # Дополняем адресами пиров
+                    if self.cli.node and self.cli.node.transport:
+                        for peer in self.cli.node.transport.get_peers():
+                            addr = peer.get('address', '')
+                            if addr and addr.startswith(words[-1] if len(words) > 1 else ''):
+                                yield Completion(addr, start_position=-len(words[-1]) if len(words) > 1 else 0)
+                
+                elif cmd == 'send' and len(words) == 2:
+                    # Дополняем контактами
+                    contacts = self.cli._get_contacts()
+                    for contact in contacts:
+                        if contact.startswith(words[-1]):
+                            yield Completion(contact, start_position=-len(words[-1]))
+                
+                elif cmd == 'chat' and len(words) == 2:
+                    contacts = self.cli._get_contacts()
+                    for contact in contacts:
+                        if contact.startswith(words[-1]):
+                            yield Completion(contact, start_position=-len(words[-1]))
+    
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
+    MurnetCompleter = None  # Заглушка
 
 
-@dataclass
-class AppState:
-    """Состояние приложения"""
-    running: bool = True
-    current_view: str = "dashboard"  # dashboard, chat, peers, network, dht, logs
-    messages: List[Dict] = field(default_factory=list)
-    peers: List[Dict] = field(default_factory=list)
-    logs: queue.Queue = field(default_factory=queue.Queue)
-    selected_contact: Optional[str] = None
-    last_update: float = 0
-    show_help: bool = False
-    input_buffer: str = ""
-    notification: Optional[str] = None
-    notification_time: float = 0
+class MurnetInteractiveShell(cmd.Cmd):
+    """
+    Интерактивная оболочка для управления Murnet узлом
+    """
+    
+    intro = None  # Устанавливается динамически
+    prompt = "murnet> "
+    
+    def __init__(self, cli):
+        super().__init__()
+        self.cli = cli
+        self.node = cli.node
+        self.console = cli.console
+        self._update_prompt()
+        
+        # История команд
+        if HAS_PROMPT_TOOLKIT:
+            history_path = Path.home() / '.murnet_history'
+            self.session = PromptSession(
+                history=FileHistory(str(history_path)),
+                completer=MurnetCompleter(cli),
+                auto_suggest=AutoSuggestFromHistory()
+            )
+    
+    def _update_prompt(self):
+        """Обновление приглашения с информацией о статусе"""
+        if self.node and self.node.transport:
+            peer_count = len(self.node.transport.get_peers())
+            status = "🟢" if self.node.running else "🔴"
+            self.prompt = f"{status} [{peer_count}] murnet> "
+        else:
+            self.prompt = "🔴 [?] murnet> "
+    
+    def preloop(self):
+        """Перед запуском цикла"""
+        self._show_banner()
+        self._print_status()
+    
+    def precmd(self, line):
+        """Перед выполнением команды"""
+        self._update_prompt()
+        return line.strip()
+    
+    def postcmd(self, stop, line):
+        """После выполнения команды"""
+        self._update_prompt()
+        return stop
+    
+    def emptyline(self):
+        """Пустая строка - обновляем статус"""
+        self._print_status()
+    
+    def default(self, line):
+        """Неизвестная команда"""
+        if self.console:
+            self.console.print(f"[red]Неизвестная команда: {line}[/red]")
+            self.console.print("[dim]Введите 'help' для списка команд[/dim]")
+        else:
+            print(f"Неизвестная команда: {line}")
+    
+    def do_help(self, arg):
+        """Показать справку: help [команда]"""
+        if arg:
+            # Справка по конкретной команде
+            super().do_help(arg)
+        else:
+            self._show_help()
+    
+    def do_quit(self, arg):
+        """Выйти из оболочки и остановить узел"""
+        return self._do_exit()
+    
+    def do_exit(self, arg):
+        """Выйти из оболочки и остановить узел"""
+        return self._do_exit()
+    
+    def _do_exit(self):
+        """Выход с подтверждением"""
+        if HAS_PROMPT_TOOLKIT:
+            try:
+                if confirm("Остановить узел и выйти?"):
+                    self.cli._shutdown()
+                    return True
+            except:
+                self.cli._shutdown()
+                return True
+        else:
+            self.cli._shutdown()
+            return True
+        return False
+    
+    def do_status(self, arg):
+        """Показать полный статус узла"""
+        if not self._check_node():
+            return
+        
+        try:
+            status = self.node.get_status()
+            storage_stats = self.node.storage.get_stats() if self.node.storage else {}
+            
+            if self.console:
+                # Создаем красивую таблицу
+                grid = Table.grid(expand=True)
+                grid.add_column(style="cyan")
+                grid.add_column(style="white")
+                grid.add_column(style="cyan")
+                grid.add_column(style="white")
+                
+                uptime = status.get('stats', {}).get('uptime', 0)
+                hours, rem = divmod(int(uptime), 3600)
+                minutes, seconds = divmod(rem, 60)
+                
+                grid.add_row(
+                    "📍 Адрес:", self.node.address[:40],
+                    "⏱️  Аптайм:", f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                )
+                grid.add_row(
+                    "🌐 Пиров:", str(len(self.node.transport.get_peers())),
+                    "📨 Сообщений:", str(storage_stats.get('messages', 0))
+                )
+                grid.add_row(
+                    "📬 Непрочитанных:", str(storage_stats.get('messages_unread', 0)),
+                    "🗄️  DHT записей:", str(status.get('dht_entries', 0))
+                )
+                grid.add_row(
+                    "💾 Размер БД:", f"{storage_stats.get('db_size_mb', 0):.2f} MB",
+                    "🔐 E2E сессий:", str(status.get('security', {}).get('e2e_ready', 0))
+                )
+                
+                self.console.print(Panel(grid, title="[bold green]Статус узла[/bold green]", border_style="green"))
+            else:
+                print(f"Адрес: {self.node.address}")
+                print(f"Пиры: {len(self.node.transport.get_peers())}")
+                print(f"Сообщений: {storage_stats.get('messages', 0)}")
+                
+        except Exception as e:
+            self._error(f"Ошибка получения статуса: {e}")
+    
+    def do_peers(self, arg):
+        """Управление пирами: peers [list|drop <addr>]"""
+        if not self._check_node():
+            return
+        
+        args = shlex.split(arg) if arg else ['list']
+        cmd = args[0] if args else 'list'
+        
+        if cmd == 'list':
+            self._show_peers()
+        elif cmd == 'drop' and len(args) > 1:
+            self._drop_peer(args[1])
+        else:
+            self._show_peers()
+    
+    def _show_peers(self):
+        """Показать список пиров"""
+        peers = self.node.transport.get_peers()
+        
+        if not peers:
+            self._info("Нет подключенных пиров")
+            return
+        
+        if self.console:
+            table = Table(
+                show_header=True, header_style="bold cyan",
+                box=box.ROUNDED, expand=True
+            )
+            table.add_column("#", width=4, justify="right")
+            table.add_column("Адрес", style="cyan")
+            table.add_column("IP:Port", style="white")
+            table.add_column("RTT", justify="right", style="green")
+            table.add_column("Статус", justify="center")
+            table.add_column("Рукопожатие", justify="center")
+            
+            for i, peer in enumerate(peers, 1):
+                rtt = f"{peer.get('rtt', 0)*1000:.1f}ms" if peer.get('rtt') else "N/A"
+                status = "🟢" if peer.get('is_active') else "🔴"
+                auth = "🔒" if peer.get('handshake_complete') else "🔓"
+                
+                table.add_row(
+                    str(i),
+                    peer.get('address', 'Unknown')[:30],
+                    f"{peer.get('ip')}:{peer.get('port')}",
+                    rtt,
+                    status,
+                    auth
+                )
+            
+            self.console.print(table)
+            self.console.print(f"\n[dim]Всего пиров: {len(peers)}[/dim]")
+        else:
+            print(f"\nПиры ({len(peers)}):")
+            for i, peer in enumerate(peers, 1):
+                status = "🟢" if peer.get('is_active') else "🔴"
+                print(f"  {i}. {status} {peer['address'][:30]}... @ {peer['ip']}:{peer['port']}")
+    
+    def _drop_peer(self, addr_or_idx):
+        """Отключить пира"""
+        peers = self.node.transport.get_peers()
+        
+        # Пробуем как индекс
+        try:
+            idx = int(addr_or_idx) - 1
+            if 0 <= idx < len(peers):
+                addr = peers[idx]['address']
+            else:
+                self._error(f"Неверный номер пира: {addr_or_idx}")
+                return
+        except ValueError:
+            addr = addr_or_idx
+        
+        # Отключаем
+        success = self.node.transport.disconnect_peer(addr)
+        if success:
+            self._success(f"Пир {addr[:20]}... отключен")
+        else:
+            self._error(f"Не удалось отключить пира {addr[:20]}...")
+    
+    def do_connect(self, arg):
+        """Подключиться к пиру: connect <ip:port>"""
+        if not self._check_node():
+            return
+        
+        if not arg:
+            self._error("Укажите адрес: connect <ip:port>")
+            return
+        
+        try:
+            if ':' in arg:
+                ip, port_str = arg.rsplit(':', 1)
+                port = int(port_str)
+            else:
+                ip = arg
+                port = 8888
+            
+            self._info(f"Подключение к {ip}:{port}...")
+            
+            success = self.node.transport.connect_to(ip, port)
+            
+            if success:
+                self._success(f"Подключено к {ip}:{port}")
+            else:
+                self._error(f"Не удалось подключиться к {ip}:{port}")
+                
+        except Exception as e:
+            self._error(f"Ошибка подключения: {e}")
+    
+    def do_send(self, arg):
+        """Отправить сообщение: send <адрес> <сообщение>"""
+        if not self._check_node():
+            return
+        
+        args = shlex.split(arg)
+        if len(args) < 2:
+            self._error("Использование: send <адрес> <сообщение>")
+            return
+        
+        to_addr = args[0]
+        message = ' '.join(args[1:])
+        
+        try:
+            msg_id = self.node.send_message(to_addr, message)
+            if msg_id:
+                self._success(f"Отправлено! ID: {msg_id[:16]}...")
+            else:
+                self._error("Не удалось отправить сообщение")
+        except Exception as e:
+            self._error(f"Ошибка отправки: {e}")
+    
+    def do_chat(self, arg):
+        """Интерактивный чат с контактом: chat <адрес>"""
+        if not self._check_node():
+            return
+        
+        if not arg:
+            # Показываем список контактов
+            contacts = self.cli._get_contacts()
+            if not contacts:
+                self._info("Нет контактов. Используйте: chat <адрес>")
+                return
+            
+            if self.console:
+                self.console.print("[cyan]Доступные контакты:[/cyan]")
+                for i, contact in enumerate(contacts[:10], 1):
+                    self.console.print(f"  {i}. {contact[:40]}...")
+                self.console.print(f"\n[dim]Введите: chat <номер или адрес>[/dim]")
+            else:
+                print("Контакты:")
+                for i, contact in enumerate(contacts[:10], 1):
+                    print(f"  {i}. {contact[:40]}...")
+            return
+        
+        # Определяем адрес (может быть номером из списка)
+        try:
+            idx = int(arg) - 1
+            contacts = self.cli._get_contacts()
+            if 0 <= idx < len(contacts):
+                addr = contacts[idx]
+            else:
+                addr = arg
+        except ValueError:
+            addr = arg
+        
+        self._start_interactive_chat(addr)
+    
+    def _start_interactive_chat(self, addr):
+        """Интерактивный режим чата"""
+        if self.console:
+            self.console.print(f"\n[bold cyan]💬 Чат с {addr[:40]}...[/bold cyan]")
+            self.console.print("[dim]Введите сообщение (пустая строка для выхода)[/dim]\n")
+        else:
+            print(f"\n--- Чат с {addr[:40]}... ---")
+        
+        # Показываем историю
+        self._show_chat_history(addr)
+        
+        while True:
+            try:
+                if HAS_PROMPT_TOOLKIT and hasattr(self, 'session'):
+                    message = self.session.prompt("> ", multiline=False)
+                else:
+                    message = input("> ")
+                
+                if not message.strip():
+                    break
+                
+                msg_id = self.node.send_message(addr, message.strip())
+                if msg_id:
+                    if self.console:
+                        self.console.print(f"[dim]✓ Отправлено[/dim]")
+                    else:
+                        print("  ✓ Отправлено")
+                else:
+                    self._error("Ошибка отправки")
+                    
+            except (KeyboardInterrupt, EOFError):
+                break
+        
+        if self.console:
+            self.console.print(f"[dim]--- Чат завершен ---[/dim]\n")
+        else:
+            print("---\n")
+    
+    def _show_chat_history(self, addr, limit=10):
+        """Показать историю переписки"""
+        if not self.node or not self.node.storage:
+            return
+        
+        messages = self.node.storage.get_messages(self.node.address, limit=100)
+        chat_msgs = [m for m in messages 
+                    if m.get('from') == addr or m.get('to') == addr]
+        chat_msgs = sorted(chat_msgs, key=lambda x: x.get('timestamp', 0))[-limit:]
+        
+        if self.console and chat_msgs:
+            self.console.print("[dim]История:[/dim]")
+        
+        for msg in chat_msgs:
+            is_me = msg.get('from') == self.node.address
+            ts = datetime.fromtimestamp(msg.get('timestamp', 0)).strftime('%H:%M')
+            content = msg.get('content', '')
+            
+            if self.console:
+                color = "green" if is_me else "blue"
+                prefix = "Вы" if is_me else msg.get('from', 'Unknown')[:8]
+                self.console.print(f"  [{color}]{ts} {prefix}:[/{color}] {content}")
+            else:
+                prefix = ">>" if is_me else "<<"
+                print(f"  {prefix} [{ts}] {content}")
+    
+    def do_broadcast(self, arg):
+        """Широковещательная рассылка: broadcast <сообщение>"""
+        if not self._check_node():
+            return
+        
+        if not arg:
+            self._error("Введите сообщение: broadcast <текст>")
+            return
+        
+        try:
+            sent = self.node.transport.broadcast({
+                'type': 'broadcast',
+                'text': arg,
+                'from': self.node.address,
+                'timestamp': time.time()
+            })
+            self._success(f"Рассылка выполнена: {sent} пиров")
+        except Exception as e:
+            self._error(f"Ошибка рассылки: {e}")
+    
+    def do_dht(self, arg):
+        """Управление DHT: dht [get <key>|put <key> <value>|stats]"""
+        if not self._check_node():
+            return
+        
+        args = shlex.split(arg) if arg else ['stats']
+        cmd = args[0] if args else 'stats'
+        
+        try:
+            if cmd == 'stats':
+                stats = self.node.murnaked.get_stats() if hasattr(self.node, 'murnaked') else {}
+                if self.console:
+                    table = Table(show_header=False, box=box.SIMPLE)
+                    table.add_column(style="cyan")
+                    table.add_column(style="white")
+                    
+                    for key, value in stats.items():
+                        table.add_row(key, str(value))
+                    self.console.print(Panel(table, title="DHT Статистика"))
+                else:
+                    print("DHT Stats:", stats)
+                    
+            elif cmd == 'get' and len(args) > 1:
+                key = args[1]
+                value = self.node.murnaked.get(key) if hasattr(self.node, 'murnaked') else None
+                if value:
+                    self._success(f"{key} = {value}")
+                else:
+                    self._info(f"Ключ {key} не найден")
+                    
+            elif cmd == 'put' and len(args) > 2:
+                key, value = args[1], args[2]
+                success = self.node.murnaked.put(key, value) if hasattr(self.node, 'murnaked') else False
+                if success:
+                    self._success(f"Сохранено: {key}")
+                else:
+                    self._error("Не удалось сохранить")
+            else:
+                self._info("Использование: dht [stats|get <key>|put <key> <value>]")
+                
+        except Exception as e:
+            self._error(f"Ошибка DHT: {e}")
+    
+    def do_routes(self, arg):
+        """Показать таблицу маршрутизации"""
+        if not self._check_node():
+            return
+        
+        try:
+            routes = self.node.routing.get_all_routes() if hasattr(self.node, 'routing') else {}
+            
+            if not routes:
+                self._info("Таблица маршрутизации пуста")
+                return
+            
+            if self.console:
+                table = Table(
+                    show_header=True, header_style="bold cyan",
+                    box=box.ROUNDED, expand=True
+                )
+                table.add_column("Назначение", style="cyan")
+                table.add_column("Следующий узел", style="white")
+                table.add_column("Стоимость", justify="right", style="green")
+                table.add_column("Хопов", justify="center")
+                
+                for dest, info in list(routes.items())[:20]:
+                    table.add_row(
+                        dest[:35],
+                        info.get('next_hop', 'Unknown')[:30],
+                        f"{info.get('cost', 0):.2f}",
+                        str(info.get('hop_count', '?'))
+                    )
+                
+                self.console.print(table)
+                self.console.print(f"\n[dim]Всего маршрутов: {len(routes)}[/dim]")
+            else:
+                print(f"\nМаршруты ({len(routes)}):")
+                for dest, info in routes.items():
+                    print(f"  {dest[:30]}... -> {info.get('next_hop', 'Unknown')[:20]}... "
+                          f"(cost: {info.get('cost', 0):.2f})")
+                      
+        except Exception as e:
+            self._error(f"Ошибка: {e}")
+    
+    def do_storage(self, arg):
+        """Управление хранилищем: storage [stats|clean|export]"""
+        if not self._check_node() or not self.node.storage:
+            return
+        
+        args = shlex.split(arg) if arg else ['stats']
+        cmd = args[0] if args else 'stats'
+        
+        try:
+            if cmd == 'stats':
+                stats = self.node.storage.get_stats()
+                if self.console:
+                    table = Table(show_header=False, box=box.SIMPLE)
+                    table.add_column(style="cyan")
+                    table.add_column(style="white")
+                    for k, v in stats.items():
+                        table.add_row(k, str(v))
+                    self.console.print(Panel(table, title="Storage Stats"))
+                else:
+                    print("Storage:", stats)
+                    
+            elif cmd == 'clean':
+                # Очистка старых сообщений
+                deleted = self.node.storage.clean_old_messages(days=30)
+                self._success(f"Удалено старых сообщений: {deleted}")
+                
+            elif cmd == 'export':
+                path = args[1] if len(args) > 1 else f"murnet_export_{int(time.time())}.json"
+                data = self.node.storage.export_all()
+                with open(path, 'w') as f:
+                    json.dump(data, f, indent=2)
+                self._success(f"Экспортировано в {path}")
+            else:
+                self._info("Использование: storage [stats|clean|export <path>]")
+                
+        except Exception as e:
+            self._error(f"Ошибка: {e}")
+    
+    def do_identity(self, arg):
+        """Управление идентификацией: identity [show|export|import]"""
+        if not self._check_node():
+            return
+        
+        args = shlex.split(arg) if arg else ['show']
+        cmd = args[0] if args else 'show'
+        
+        try:
+            if cmd == 'show':
+                if self.console:
+                    self.console.print(f"[cyan]Адрес:[/cyan] {self.node.address}")
+                    self.console.print(f"[cyan]Публичный ключ:[/cyan] {self.node.identity.public_key.hex()[:64]}...")
+                else:
+                    print(f"Адрес: {self.node.address}")
+                    
+            elif cmd == 'export':
+                path = args[1] if len(args) > 1 else "identity_backup.json"
+                # Экспорт ключей (зашифрованный)
+                self._info("Функция экспорта ключей...")
+                
+            elif cmd == 'import':
+                self._error("Импорт возможен только при запуске узла")
+            else:
+                self._info("Использование: identity [show|export]")
+                
+        except Exception as e:
+            self._error(f"Ошибка: {e}")
+    
+    def do_config(self, arg):
+        """Показать/изменить конфигурацию: config [show|set <key> <value>]"""
+        args = shlex.split(arg) if arg else ['show']
+        cmd = args[0] if args else 'show'
+        
+        if cmd == 'show':
+            config_dict = self.cli.config.to_dict() if hasattr(self.cli.config, 'to_dict') else {}
+            if self.console:
+                self.console.print(Syntax(json.dumps(config_dict, indent=2), "json"))
+            else:
+                print(json.dumps(config_dict, indent=2))
+        else:
+            self._info("Динамическое изменение конфига пока не поддерживается")
+    
+    def do_logs(self, arg):
+        """Показать последние логи: logs [lines]"""
+        lines = int(arg) if arg.isdigit() else 20
+        
+        # Здесь можно добавить чтение из файла логов
+        self._info("Логи системы...")
+        # TODO: implement log reading
+    
+    def do_clear(self, arg):
+        """Очистить экран"""
+        if self.console:
+            self.console.clear()
+        else:
+            os.system('clear' if os.name != 'nt' else 'cls')
+    
+    def do_shell(self, arg):
+        """Выполнить shell команду: shell <команда>"""
+        if arg:
+            os.system(arg)
+        else:
+            self._info("Использование: shell <команда>")
+    
+    def do_restart(self, arg):
+        """Перезапустить узел"""
+        self._info("Перезапуск узла...")
+        self.cli._restart_node()
+        self.node = self.cli.node
+        self._success("Узел перезапущен")
+    
+    def do_stop(self, arg):
+        """Остановить узел (без выхода)"""
+        if self.node and self.node.running:
+            self.node.stop()
+            self._success("Узел остановлен")
+        else:
+            self._info("Узел уже остановлен")
+    
+    def do_start(self, arg):
+        """Запустить узел (если остановлен)"""
+        if not self.node or not self.node.running:
+            self.cli._start_node()
+            self.node = self.cli.node
+            self._success("Узел запущен")
+        else:
+            self._info("Узел уже работает")
+    
+    def do_api(self, arg):
+        """Управление API сервером: api [start|stop|status]"""
+        args = shlex.split(arg) if arg else ['status']
+        cmd = args[0] if args else 'status'
+        
+        if cmd == 'status':
+            status = "🟢 Работает" if self.cli.api_server else "🔴 Остановлен"
+            self._info(f"API сервер: {status}")
+        elif cmd == 'start':
+            self.cli._start_api()
+            self._success("API сервер запущен")
+        elif cmd == 'stop':
+            self.cli._stop_api()
+            self._success("API сервер остановлен")
+    
+    def do_debug(self, arg):
+        """Отладочная информация"""
+        if not self._check_node():
+            return
+        
+        debug_info = {
+            'node_running': self.node.running,
+            'transport_peers': len(self.node.transport.get_peers()) if self.node.transport else 0,
+            'storage_ready': self.node.storage is not None,
+            'address': self.node.address,
+            'threads': threading.active_count(),
+        }
+        
+        if self.console:
+            self.console.print(Syntax(json.dumps(debug_info, indent=2), "json"))
+        else:
+            print(json.dumps(debug_info, indent=2))
+    
+    def _check_node(self):
+        """Проверка, что узел запущен"""
+        if not self.node or not self.node.running:
+            self._error("Узел не запущен. Используйте 'start'")
+            return False
+        return True
+    
+    def _show_banner(self):
+        """Показать баннер"""
+        if self.console:
+            banner = """
+[bold cyan]
+╔══════════════════════════════════════════════════════════════╗
+║                    🌐  M U R N E T   v 5 . 1                 ║
+║                                                              ║
+║              Интерактивная командная оболочка                ║
+╚══════════════════════════════════════════════════════════════╝
+[/bold cyan]
+            """
+            self.console.print(banner)
+        else:
+            print("\n=== MURNET v5.1 ===\n")
+    
+    def _show_help(self):
+        """Показать справку"""
+        help_text = """
+[bold cyan]Основные команды:[/bold cyan]
+  [green]status[/green]              - Статус узла
+  [green]peers[/green] [list|drop]     - Список пиров или отключение
+  [green]connect[/green] <ip:port>   - Подключиться к пиру
+  [green]send[/green] <addr> <msg>  - Отправить сообщение
+  [green]chat[/green] [addr]         - Интерактивный чат
+  [green]broadcast[/green] <msg>    - Широковещательная рассылка
+
+[bold cyan]Сеть и хранилище:[/bold cyan]
+  [green]routes[/green]              - Таблица маршрутизации
+  [green]dht[/green] [stats|get|put] - Управление DHT
+  [green]storage[/green] [stats|...] - Управление хранилищем
+
+[bold cyan]Управление:[/bold cyan]
+  [green]identity[/green] [show]     - Информация об идентификации
+  [green]config[/green] [show]       - Конфигурация
+  [green]start[/green], [green]stop[/green], [green]restart[/green] - Управление узлом
+  [green]api[/green] [start|stop]    - Управление API
+  [green]clear[/green]               - Очистить экран
+  [green]quit[/green], [green]exit[/green]          - Выйти и остановить узел
+
+[dim]Для подробной справки: help <команда>[/dim]
+        """
+        if self.console:
+            self.console.print(help_text)
+        else:
+            print(help_text)
+    
+    def _print_status(self):
+        """Печать краткого статуса"""
+        if self.node and self.node.running:
+            peers = len(self.node.transport.get_peers()) if self.node.transport else 0
+            self._info(f"Узел активен | Пиры: {peers} | Адрес: {self.node.address[:20]}...")
+    
+    def _success(self, msg):
+        if self.console:
+            self.console.print(f"[green]✓ {msg}[/green]")
+        else:
+            print(f"✓ {msg}")
+    
+    def _error(self, msg):
+        if self.console:
+            self.console.print(f"[red]✗ {msg}[/red]")
+        else:
+            print(f"✗ {msg}")
+    
+    def _info(self, msg):
+        if self.console:
+            self.console.print(f"[cyan]ℹ {msg}[/cyan]")
+        else:
+            print(f"ℹ {msg}")
 
 
 class MurnetCLI:
     """
-    Полноценное CLI приложение для Murnet
-    - Запускает узел
-    - Предоставляет интерактивный интерфейс
-    - Работает в одном процессе
+    Главный класс CLI приложения
     """
-    
-    VIEWS = ["dashboard", "chat", "peers", "network", "dht", "logs"]
     
     def __init__(self):
         self.node: Optional[MurnetNode] = None
         self.api_server: Optional[MurnetAPIServer] = None
         self.config: Optional[MurnetConfig] = None
-        self.state = AppState()
-        
         self.console = Console() if HAS_RICH else None
-        self.use_tui = HAS_RICH and os.environ.get('TERM') not in ['dumb', '']
-        
-        self._lock = threading.Lock()
-        self._input_event = threading.Event()
-        self._last_command = ""
+        self.args = None
         
         # Graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -98,42 +837,35 @@ class MurnetCLI:
     
     def _signal_handler(self, signum, frame):
         """Обработчик сигналов"""
-        self.state.running = False
         if self.console:
             self.console.print("\n[yellow]Получен сигнал завершения...[/yellow]")
+        self._shutdown()
+        sys.exit(0)
     
     def run(self):
         """Главная точка входа"""
         parser = self._create_parser()
-        args = parser.parse_args()
+        self.args = parser.parse_args()
         
         # Загрузка конфигурации
-        self._load_config(args)
+        self._load_config()
         
         # Обработка команд
-        if args.command is None:
-            if args.daemon:
-                self._run_daemon(args)
-            else:
-                self._run_interactive(args)
+        if self.args.command is None:
+            self._run_interactive()
         else:
-            handler = getattr(self, f'_cmd_{args.command}', None)
-            if handler:
-                handler(args)
-            else:
-                parser.print_help()
+            self._run_single_command()
     
     def _create_parser(self) -> argparse.ArgumentParser:
         """Создание парсера аргументов"""
         parser = argparse.ArgumentParser(
-            description="🌐 Murnet v5.0 - Децентрализованная P2P сеть",
+            description="🌐 Murnet v6.0 - Децентрализованная P2P сеть",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Примеры:
-  %(prog)s                           # Интерактивный режим
+  %(prog)s                           # Интерактивная оболочка
   %(prog)s --daemon                  # Фоновый режим
-  %(prog)s send <addr> "привет"      # Быстрая отправка
-  %(prog)s status                    # Показать статус
+  %(prog)s send <addr> "привет"      # Однократная команда
             """
         )
         
@@ -144,7 +876,6 @@ class MurnetCLI:
         parser.add_argument("--port", "-p", type=int, default=8888, help="P2P порт")
         parser.add_argument("--api-port", type=int, default=8080, help="API порт")
         parser.add_argument("--no-api", action="store_true", help="Без API сервера")
-        parser.add_argument("--no-tui", action="store_true", help="Без TUI (простой режим)")
         parser.add_argument("--daemon", action="store_true", help="Фоновый режим")
         
         subparsers = parser.add_subparsers(dest="command", help="Команды")
@@ -164,151 +895,68 @@ class MurnetCLI:
         
         return parser
     
-    def _load_config(self, args):
+    def _load_config(self):
         """Загрузка конфигурации"""
-        if args.config:
-            self.config = MurnetConfig.from_file(args.config)
+        if self.args.config:
+            self.config = MurnetConfig.from_file(self.args.config)
         else:
             self.config = get_config()
         
-        if args.profile:
-            self.config.apply_profile(args.profile)
+        if self.args.profile:
+            self.config.apply_profile(self.args.profile)
         
         set_config(self.config)
     
-    def _run_daemon(self, args):
-        """Фоновый режим"""
-        self._print("👻 Запуск в фоновом режиме...")
-        
-        try:
-            import daemon
-            with daemon.DaemonContext():
-                self._run_simple_mode(args, silent=True)
-        except ImportError:
-            self._print("⚠️ python-daemon не установлен, запуск в foreground")
-            self._run_simple_mode(args)
-    
-    def _run_interactive(self, args):
-        """Интерактивный режим с TUI"""
-        if not self.use_tui or args.no_tui:
-            self._run_simple_mode(args)
+    def _run_interactive(self):
+        """Запуск интерактивной оболочки"""
+        # Запускаем узел
+        if not self._start_node():
             return
         
-        self._show_banner()
+        # Запускаем API если нужно
+        if not self.args.no_api:
+            self._start_api()
         
-        if not self._init_node(args):
-            return
-        
-        self._start_background_tasks()
-        
+        # Запускаем оболочку
         try:
-            self._main_loop()
+            shell = MurnetInteractiveShell(self)
+            if HAS_PROMPT_TOOLKIT:
+                # Используем prompt_toolkit для улучшенного ввода
+                while True:
+                    try:
+                        shell._update_prompt()
+                        text = shell.session.prompt(shell.prompt)
+                        if text.strip():
+                            shell.onecmd(text)
+                    except KeyboardInterrupt:
+                        continue
+                    except EOFError:
+                        break
+            else:
+                shell.cmdloop()
         except Exception as e:
-            self._log(f"[red]Ошибка: {e}[/red]")
+            if self.console:
+                self.console.print(f"[red]Ошибка: {e}[/red]")
         finally:
             self._shutdown()
     
-    def _run_simple_mode(self, args, silent=False):
-        """Простой режим без TUI"""
-        if not silent:
-            self._print("🚀 Murnet Simple Mode")
-            self._print(f"Запуск узла на порту {args.port}...")
-        
-        try:
-            self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
-            self.node.start()
-            
-            if not silent:
-                self._print(f"✓ Узел запущен: {self.node.address}")
-                self._print(f"P2P порт: {args.port}")
-                self._print("\nКоманды: status, peers, send, chat, broadcast, exit")
-            
-            while self.state.running:
-                try:
-                    cmd = input("\nmurnet> ").strip()
-                    self._handle_simple_command(cmd)
-                except (KeyboardInterrupt, EOFError):
-                    break
-                except Exception as e:
-                    self._print(f"Ошибка: {e}")
-        
-        finally:
-            if not silent:
-                self._print("\n🛑 Остановка узла...")
-            if self.node:
-                self.node.stop()
-            if not silent:
-                self._print("✓ Узел остановлен")
-    
-    def _handle_simple_command(self, cmd: str):
-        """Обработка команд в простом режиме"""
-        if not cmd:
+    def _run_single_command(self):
+        """Выполнение одиночной команды"""
+        # Запускаем узел временно
+        if not self._start_node():
             return
         
-        parts = cmd.split(None, 1)
-        command = parts[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
-        
-        if command in ["exit", "quit", "q"]:
-            self.state.running = False
-        elif command == "status":
-            self._show_status_simple()
-        elif command == "peers":
-            self._show_peers_simple()
-        elif command == "send":
-            subparts = args.split(None, 1)
-            if len(subparts) == 2:
-                msg_id = self.node.send_message(subparts[0], subparts[1])
-                self._print(f"✓ {msg_id[:16]}..." if msg_id else "✗ Ошибка")
-        elif command == "chat":
-            self._simple_chat()
-        elif command == "broadcast":
-            if args:
-                sent = self.node.transport.broadcast({
-                    'type': 'broadcast',
-                    'text': args,
-                    'from': self.node.address
-                })
-                self._print(f"✓ Рассылка: {sent} пиров")
-        elif command == "connect":
-            if ":" in args:
-                ip, port = args.rsplit(":", 1)
-                try:
-                    port = int(port)
-                    success = self.node.transport.connect_to(ip, port)
-                    self._print(f"{'✓' if success else '✗'} Подключение к {args}")
-                except ValueError:
-                    self._print("Неверный порт")
-        elif command == "help":
-            self._print("""
-Команды:
-  status      - Статус узла
-  peers       - Список пиров
-  send        - Отправить сообщение (send <addr> <msg>)
-  chat        - Интерактивный чат
-  broadcast   - Широковещательная рассылка
-  connect     - Подключиться к пиру (connect <IP:PORT>)
-  exit        - Выход
-            """)
+        try:
+            handler = getattr(self, f'_cmd_{self.args.command}', None)
+            if handler:
+                handler(self.args)
+            else:
+                print(f"Неизвестная команда: {self.args.command}")
+        finally:
+            self._shutdown()
     
-    def _show_banner(self):
-        """Показать баннер"""
-        banner = """
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║   🌐  M U R N E T   v 5 . 1                                 ║
-║                                                              ║
-║   Децентрализованная P2P сеть                               ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
-        """
-        if self.console:
-            self.console.print(Panel(banner.strip(), style="cyan", box=box.DOUBLE))
-        else:
-            print(banner)
-    
-    def _init_node(self, args) -> bool:
-        """Инициализация узла"""
+    def _start_node(self) -> bool:
+        """Запуск узла"""
         try:
             if self.console:
                 with Progress(
@@ -318,786 +966,124 @@ class MurnetCLI:
                     transient=True
                 ) as progress:
                     
-                    task = progress.add_task("[cyan]Инициализация...", total=None)
+                    task = progress.add_task("[cyan]Запуск узла...", total=None)
                     
-                    progress.update(task, description="[cyan]Создание узла...")
-                    self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
-                    
-                    progress.update(task, description="[cyan]Запуск P2P...")
+                    self.node = MurnetNode(
+                        data_dir=self.args.data_dir,
+                        port=self.args.port
+                    )
                     self.node.start()
                     
-                    if not args.no_api:
-                        progress.update(task, description="[cyan]Запуск API...")
-                        self.api_server = MurnetAPIServer(
-                            self.node,
-                            host=self.config.api.host,
-                            port=args.api_port
-                        )
-                        threading.Thread(target=self.api_server.run, daemon=True).start()
-                    
-                    progress.update(task, description="[green]✓ Готово!")
-                    time.sleep(0.3)
+                    progress.update(task, description="[green]✓ Узел запущен")
+                    time.sleep(0.5)
             else:
-                self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
+                print("Запуск узла...")
+                self.node = MurnetNode(
+                    data_dir=self.args.data_dir,
+                    port=self.args.port
+                )
                 self.node.start()
-                
-                if not args.no_api:
-                    self.api_server = MurnetAPIServer(
-                        self.node,
-                        host=self.config.api.host,
-                        port=args.api_port
-                    )
-                    threading.Thread(target=self.api_server.run, daemon=True).start()
+                print(f"✓ Узел запущен: {self.node.address}")
             
-            info_lines = [
-                f"Адрес: {self.node.address}",
-                f"P2P порт: {args.port}",
-            ]
-            if self.api_server:
-                info_lines.append(f"API: http://{self.config.api.host}:{args.api_port}")
-            
-            if self.console:
-                self.console.print(Panel(
-                    "\n".join(info_lines), 
-                    title="[green]✓ Узел запущен[/green]", 
-                    border_style="green"
-                ))
-            
-            time.sleep(0.5)
             return True
             
         except Exception as e:
-            self._print(f"[red]✗ Ошибка: {e}[/red]")
+            if self.console:
+                self.console.print(f"[red]✗ Ошибка запуска: {e}[/red]")
+            else:
+                print(f"✗ Ошибка запуска: {e}")
             return False
     
-    def _start_background_tasks(self):
-        """Запуск фоновых задач"""
-        tasks = [
-            ("messages", self._update_messages, 2),
-            ("peers", self._update_peers, 3),
-        ]
-        
-        for name, target, interval in tasks:
-            t = threading.Thread(
-                target=self._worker_loop,
-                args=(target, interval),
-                name=f"BG-{name}",
-                daemon=True
-            )
-            t.start()
+    def _restart_node(self):
+        """Перезапуск узла"""
+        self._shutdown_node()
+        time.sleep(1)
+        self._start_node()
     
-    def _worker_loop(self, target, interval):
-        """Цикл фоновой задачи"""
-        while self.state.running:
-            try:
-                target()
-            except Exception as e:
-                pass
-            time.sleep(interval)
-    
-    def _update_messages(self):
-        """Обновление сообщений"""
-        if self.node and self.node.storage:
-            msgs = self.node.storage.get_messages(self.node.address, limit=100)
-            
-            old_ids = {m['id'] for m in self.state.messages}
-            for msg in msgs:
-                if msg['id'] not in old_ids:
-                    if msg.get('to') == self.node.address and not msg.get('read'):
-                        from_addr = msg.get('from', 'Unknown')[:16]
-                        preview = msg.get('content', '')[:30]
-                        self._show_notification(f"📨 {from_addr}...: {preview}")
-            
-            with self._lock:
-                self.state.messages = msgs
-    
-    def _update_peers(self):
-        """Обновление пиров"""
-        if self.node and self.node.transport:
-            peers = self.node.transport.get_peers()
-            with self._lock:
-                self.state.peers = peers
-    
-    def _show_notification(self, message: str, duration: float = 3.0):
-        """Показать уведомление"""
-        with self._lock:
-            self.state.notification = message
-            self.state.notification_time = time.time()
-        
-        def clear():
-            time.sleep(duration)
-            with self._lock:
-                if time.time() - self.state.notification_time >= duration:
-                    self.state.notification = None
-        
-        threading.Thread(target=clear, daemon=True).start()
-    
-    def _main_loop(self):
-        """Главный цикл TUI"""
-        input_thread = threading.Thread(target=self._input_thread, daemon=True)
-        input_thread.start()
-        
-        while self.state.running:
-            try:
-                if self.console:
-                    self.console.clear()
-                    self._render_current_view()
-                time.sleep(0.2)
-            except Exception as e:
-                time.sleep(1)
-    
-    def _input_thread(self):
-        """Поток ввода"""
-        while self.state.running:
-            try:
-                import select
-                import sys
-                
-                if select.select([sys.stdin], [], [], 0.5)[0]:
-                    line = sys.stdin.readline().strip()
-                    if line:
-                        self._handle_input(line)
-            except:
-                time.sleep(0.5)
-    
-    def _handle_input(self, line: str):
-        """Обработка ввода"""
-        if not line:
-            return
-        
-        # Односимвольные команды
-        if len(line) == 1:
-            cmd = line.lower()
-            
-            if cmd == "1":
-                self.state.current_view = "dashboard"
-            elif cmd == "2":
-                self.state.current_view = "chat"
-            elif cmd == "3":
-                self.state.current_view = "peers"
-            elif cmd == "4":
-                self.state.current_view = "network"
-            elif cmd == "5":
-                self.state.current_view = "dht"
-            elif cmd == "6":
-                self.state.current_view = "logs"
-            elif cmd == "s":
-                self._action_send_message()
-            elif cmd == "c":
-                self._action_connect_peer()
-            elif cmd == "d":
-                self._action_disconnect_peer()
-            elif cmd == "b":
-                self._action_broadcast()
-            elif cmd == "r":
-                self._force_refresh()
-            elif cmd == "q":
-                self.state.running = False
-            elif cmd == "?":
-                self.state.show_help = not self.state.show_help
-            elif cmd == "n" and self.state.current_view == "chat":
-                self._action_new_chat()
-            return
-        
-        # Многосимвольные команды
-        parts = line.split(None, 1)
-        cmd = parts[0].lower()
-        
-        if cmd == "send" and len(parts) > 1:
-            subparts = parts[1].split(None, 1)
-            if len(subparts) == 2:
-                self.node.send_message(subparts[0], subparts[1])
-                self._show_notification("✓ Сообщение отправлено")
-        elif cmd == "connect" and len(parts) > 1 and ":" in parts[1]:
-            ip, port_str = parts[1].rsplit(":", 1)
-            try:
-                port = int(port_str)
-                self.node.transport.connect_to(ip, port)
-                self._show_notification(f"✓ Подключение к {ip}:{port}")
-            except:
-                self._show_notification("✗ Неверный порт")
-        elif cmd == "view" and len(parts) > 1 and parts[1] in self.VIEWS:
-            self.state.current_view = parts[1]
-        elif cmd == "help":
-            self.state.show_help = True
-    
-    def _render_current_view(self):
-        """Отрисовка текущего вида"""
-        self._render_header()
-        
-        if self.state.show_help:
-            self._render_help()
-        else:
-            renderers = {
-                "dashboard": self._render_dashboard,
-                "chat": self._render_chat,
-                "peers": self._render_peers,
-                "network": self._render_network,
-                "dht": self._render_dht,
-                "logs": self._render_logs,
-            }
-            renderer = renderers.get(self.state.current_view, self._render_dashboard)
-            renderer()
-        
-        self._render_footer()
-        
-        with self._lock:
-            if self.state.notification and time.time() - self.state.notification_time < 3:
-                self.console.print(f"\n[cyan]{self.state.notification}[/cyan]")
-    
-    def _render_header(self):
-        """Отрисовка заголовка"""
-        with self._lock:
-            peer_count = len(self.state.peers)
-            unread = len([m for m in self.state.messages 
-                        if not m.get('read') and m.get('to') == getattr(self.node, 'address', '')])
-        
-        view_colors = {
-            "dashboard": "green", "chat": "magenta", "peers": "cyan",
-            "network": "blue", "dht": "yellow", "logs": "white"
-        }
-        
-        color = view_colors.get(self.state.current_view, "white")
-        mode_str = f"[{color}]● {self.state.current_view.upper()}[/{color}]"
-        
-        header = (
-            f"[bold cyan]🌐 MURNET[/bold cyan] | "
-            f"{mode_str} | "
-            f"[cyan]📡 {peer_count} пиров[/cyan] | "
-            f"[magenta]✉️ {unread} непрочитанных[/magenta]"
-        )
-        
-        self.console.print(Panel(header, box=box.ROUNDED, style="blue"))
-    
-    def _render_dashboard(self):
-        """Дашборд"""
-        self.console.print("\n[bold cyan]📊 Статистика[/bold cyan]")
-        self.console.print(self._create_stats_table())
-        
-        self.console.print("\n[bold cyan]📨 Последние сообщения[/bold cyan]")
-        self.console.print(self._create_messages_table(limit=8))
-        
-        self.console.print("\n[bold cyan]🌐 Сеть[/bold cyan]")
-        self.console.print(self._create_peers_tree(limit=6))
-    
-    def _create_stats_table(self) -> Table:
-        """Статистика"""
-        table = Table(show_header=False, box=box.SIMPLE, expand=True)
-        table.add_column(style="cyan", width=20)
-        table.add_column(style="white")
-        table.add_column(style="cyan", width=20)
-        table.add_column(style="white")
+    def _start_api(self):
+        """Запуск API сервера"""
+        if not self.node or not self.node.running:
+            return False
         
         try:
-            status = self.node.get_status() if self.node else {}
-            storage = self.node.storage.get_stats() if self.node and self.node.storage else {}
-            
-            uptime = status.get('stats', {}).get('uptime', 0)
-            hours, rem = divmod(int(uptime), 3600)
-            minutes, seconds = divmod(rem, 60)
-            
-            table.add_row(
-                "⏱️  Аптайм:", f"{hours:02d}:{minutes:02d}:{seconds:02d}",
-                "📨 Сообщений:", str(storage.get('messages', 0))
+            self.api_server = MurnetAPIServer(
+                self.node,
+                host=self.config.api.host if hasattr(self.config, 'api') else '127.0.0.1',
+                port=self.args.api_port
             )
-            table.add_row(
-                "📬 Непрочитанных:", str(storage.get('messages_unread', 0)),
-                "🗄️  DHT записей:", str(status.get('dht_entries', 0))
-            )
-            table.add_row(
-                "💾 Размер БД:", f"{storage.get('db_size_mb', 0):.1f} MB",
-                "🔐 E2E сессий:", str(status.get('security', {}).get('e2e_ready', 0))
-            )
-        except:
-            table.add_row("[dim]Загрузка...", "", "", "")
-        
-        return table
-    
-    def _create_messages_table(self, limit: int = 10) -> Table:
-        """Таблица сообщений"""
-        table = Table(
-            show_header=True, header_style="bold cyan",
-            box=box.SIMPLE, expand=True, row_styles=["", "dim"]
-        )
-        table.add_column("Время", width=8, style="dim")
-        table.add_column("От/Кому", width=15, style="cyan")
-        table.add_column("Сообщение", style="white")
-        table.add_column("✓", width=3, justify="center")
-        
-        with self._lock:
-            messages = sorted(
-                self.state.messages,
-                key=lambda x: x.get('timestamp', 0),
-                reverse=True
-            )[:limit]
-        
-        for msg in messages:
-            ts = datetime.fromtimestamp(msg.get('timestamp', 0)).strftime('%H:%M')
-            is_me = msg.get('from') == getattr(self.node, 'address', None)
-            other = msg.get('to') if is_me else msg.get('from')
-            other_short = (other or 'Unknown')[:14]
-            
-            content = msg.get('content', '')[:40]
-            if len(content) > 40:
-                content = content[:37] + "..."
-            
-            delivered = "✓" if msg.get('delivered') else "○"
-            is_unread = not msg.get('read') and not is_me
-            style = "bold" if is_unread else ""
-            
-            table.add_row(ts, other_short, content, delivered, style=style)
-        
-        if not messages:
-            table.add_row("-", "-", "[dim]Нет сообщений[/dim]", "")
-        
-        return table
-    
-    def _create_peers_tree(self, limit: int = 6) -> Tree:
-        """Дерево пиров"""
-        tree = Tree("📡 Подключенные пиры")
-        
-        with self._lock:
-            peers = self.state.peers[:limit]
-        
-        for peer in peers:
-            status = "🟢" if peer.get('is_active') else "🔴"
-            auth = "🔒" if peer.get('handshake_complete') else "🔓"
-            rtt = f" {peer.get('rtt', 0)*1000:.0f}ms" if peer.get('rtt') else ""
-            addr = peer.get('address', 'Unknown')[:20]
-            
-            tree.add(f"{status} {auth} {addr}...{rtt}")
-        
-        with self._lock:
-            remaining = len(self.state.peers) - limit
-        
-        if remaining > 0:
-            tree.add(f"[dim]... и ещё {remaining}[/dim]")
-        
-        if not peers:
-            tree.add("[dim]Нет подключенных пиров[/dim]")
-        
-        return tree
-    
-    def _render_chat(self):
-        """Чат"""
-        self.console.print("\n[bold cyan]👥 Контакты[/bold cyan]")
-        
-        contacts = {}
-        with self._lock:
-            for msg in self.state.messages:
-                addr = msg.get('from') if msg.get('from') != getattr(self.node, 'address', None) else msg.get('to')
-                if addr:
-                    if addr not in contacts:
-                        contacts[addr] = {'unread': 0, 'last': 0}
-                    if not msg.get('read') and msg.get('to') == getattr(self.node, 'address', None):
-                        contacts[addr]['unread'] += 1
-                    contacts[addr]['last'] = max(contacts[addr]['last'], msg.get('timestamp', 0))
-        
-        sorted_contacts = sorted(contacts.items(), key=lambda x: x[1]['last'], reverse=True)
-        
-        for i, (addr, info) in enumerate(sorted_contacts[:10], 1):
-            unread = f" [red]({info['unread']})[/red]" if info['unread'] else ""
-            marker = "▶ " if addr == self.state.selected_contact else "  "
-            self.console.print(f"  {i}. {marker}{addr[:25]}...{unread}")
-        
-        self.console.print("\n[bold cyan]💬 Диалог[/bold cyan]")
-        
-        if self.state.selected_contact:
-            with self._lock:
-                msgs = [m for m in self.state.messages 
-                       if m.get('from') == self.state.selected_contact 
-                       or m.get('to') == self.state.selected_contact]
-                msgs = sorted(msgs, key=lambda x: x.get('timestamp', 0))
-            
-            for msg in msgs[-20:]:  # Последние 20 сообщений
-                is_me = msg.get('from') == getattr(self.node, 'address', None)
-                color = "green" if is_me else "blue"
-                prefix = "Вы" if is_me else msg.get('from', 'Unknown')[:8]
-                ts = datetime.fromtimestamp(msg.get('timestamp', 0)).strftime('%H:%M')
-                content = msg.get('content', '')
-                
-                self.console.print(f"  [{color}]{ts} {prefix}:[/{color}] {content}")
-            
-            if not msgs:
-                self.console.print("  [dim]Нет сообщений...[/dim]")
-        else:
-            self.console.print("  [dim]Выберите контакт (1-9) или нажмите 'n' для нового[/dim]")
-    
-    def _render_peers(self):
-        """Пиры"""
-        table = Table(
-            show_header=True, header_style="bold cyan",
-            box=box.ROUNDED, expand=True
-        )
-        table.add_column("#", width=4, justify="right")
-        table.add_column("Адрес", style="cyan")
-        table.add_column("IP:Port", style="white")
-        table.add_column("RTT", justify="right", style="green")
-        table.add_column("Статус")
-        
-        with self._lock:
-            peers = self.state.peers
-        
-        for i, peer in enumerate(peers, 1):
-            rtt = f"{peer.get('rtt', 0)*1000:.1f}ms" if peer.get('rtt') else "N/A"
-            status = "[green]● Активен[/green]" if peer.get('is_active') else "[red]● Нет[/red]"
-            
-            table.add_row(
-                str(i),
-                peer.get('address', 'Unknown')[:25],
-                f"{peer.get('ip')}:{peer.get('port')}",
-                rtt,
-                status
-            )
-        
-        if not peers:
-            table.add_row("", "[dim]Нет подключенных пиров[/dim]", "", "", "")
-        
-        self.console.print("\n[bold cyan]🌐 Управление пирами[/bold cyan]")
-        self.console.print(table)
-        self.console.print("\n[dim]Команды: c - подключиться, d - отключить[/dim]")
-    
-    def _render_network(self):
-        """Сеть"""
-        self.console.print("\n[bold cyan]🛤️  Маршрутизация[/bold cyan]")
-        
-        try:
-            routes = self.node.routing.get_all_routes() if self.node else {}
-            
-            table = Table(
-                show_header=True, header_style="bold cyan",
-                box=box.ROUNDED, expand=True
-            )
-            table.add_column("Назначение", style="cyan")
-            table.add_column("Следующий узел", style="white")
-            table.add_column("Стоимость", justify="right", style="green")
-            table.add_column("Хопов", justify="center")
-            
-            for dest, info in list(routes.items())[:20]:
-                table.add_row(
-                    dest[:30],
-                    info.get('next_hop', 'Unknown')[:25],
-                    f"{info.get('cost', 0):.2f}",
-                    str(info.get('hop_count', '?'))
-                )
-            
-            if not routes:
-                table.add_row("[dim]Нет маршрутов[/dim]", "", "", "")
-            
-            self.console.print(table)
+            self.api_thread = threading.Thread(target=self.api_server.run, daemon=True)
+            self.api_thread.start()
+            return True
         except Exception as e:
-            self.console.print(f"[red]Ошибка: {e}[/red]")
+            if self.console:
+                self.console.print(f"[yellow]⚠ Не удалось запустить API: {e}[/yellow]")
+            return False
     
-    def _render_dht(self):
-        """DHT"""
-        self.console.print("\n[bold cyan]🗄️  DHT Статистика[/bold cyan]")
-        
-        try:
-            stats = self.node.murnaked.get_stats() if self.node else {}
-            ring = stats.get('ring_stats', {})
-            
-            table = Table(show_header=False, box=box.SIMPLE, expand=True)
-            table.add_column(style="cyan", width=25)
-            table.add_column(style="white")
-            table.add_column(style="cyan", width=25)
-            table.add_column(style="white")
-            
-            table.add_row(
-                "Локальных ключей:", str(stats.get('local_keys', 0)),
-                "Виртуальных нод:", str(ring.get('total_vnodes', 0))
-            )
-            table.add_row(
-                "Сохранено записей:", str(stats.get('stored_keys', 0)),
-                "Реальных нод:", str(ring.get('real_nodes', 0))
-            )
-            table.add_row(
-                "Получено записей:", str(stats.get('retrieved_keys', 0)),
-                "Покрытие кольца:", f"{ring.get('ring_coverage', 0):.2f}%"
-            )
-            
-            self.console.print(table)
-        except Exception as e:
-            self.console.print(f"[red]Ошибка: {e}[/red]")
-    
-    def _render_logs(self):
-        """Логи"""
-        self.console.print("\n[bold cyan]📋 Системные логи[/bold cyan]")
-        self.console.print("[dim]Логи системы...[/dim]")
-    
-    def _render_help(self):
-        """Помощь"""
-        help_text = """
-[bold cyan]Управление Murnet CLI:[/bold cyan]
-
-[green]Вкладки (1-6):[/green]
-  1 / dashboard - Главный экран со статистикой
-  2 / chat      - Чат с контактами
-  3 / peers     - Управление пирами
-  4 / network   - Маршрутизация
-  5 / dht       - DHT статистика
-  6 / logs      - Системные логи
-
-[green]Действия:[/green]
-  s / send    - Отправить сообщение
-  c / connect - Подключиться к пиру
-  d / disconnect - Отключить пира
-  b / broadcast  - Широковещательно
-  r / refresh    - Обновить данные
-  q / quit       - Выход
-
-[green]В чате:[/green]
-  1-9       - Выбрать контакт
-  n         - Новый диалог
-
-[dim]Нажмите Enter для возврата...[/dim]
-        """
-        self.console.print(Panel(help_text.strip(), title="❓ Помощь", box=box.ROUNDED))
-    
-    def _render_footer(self):
-        """Футер"""
-        if self.state.show_help:
-            self.console.print("\n[dim center]Нажмите Enter для возврата[/dim]")
-        else:
-            footer = (
-                "1:Дашборд 2:Чат 3:Пиры 4:Сеть 5:DHT 6:Логи | "
-                "s:Отправить c:Подключить d:Отключить b:Широковещание r:Обновить q:Выход | ?:Помощь"
-            )
-            self.console.print(f"\n[dim]{footer}[/dim]")
-    
-    def _action_send_message(self):
-        """Отправка сообщения"""
-        self.console.clear()
-        self.console.print("[bold cyan]📤 Отправка сообщения[/bold cyan]\n")
-        
-        to = self._prompt("Кому (адрес): ")
-        if not to:
-            return
-        
-        self.console.print("[dim]Сообщение (Enter для завершения):[/dim]")
-        lines = []
-        while True:
-            line = self._prompt("> ")
-            if not line and lines:
-                break
-            if line:
-                lines.append(line)
-        
-        content = "\n".join(lines)
-        if content:
-            with self.console.status("[cyan]Отправка...[/cyan]"):
-                msg_id = self.node.send_message(to, content)
-            
-            if msg_id:
-                self._show_notification(f"✓ Отправлено: {msg_id[:16]}...")
-        
-        self._prompt("\nНажмите Enter...")
-    
-    def _action_connect_peer(self):
-        """Подключение к пиру"""
-        self.console.clear()
-        self.console.print("[bold cyan]🔗 Подключение к пиру[/bold cyan]\n")
-        
-        ip = self._prompt("IP: ")
-        if not ip:
-            return
-        
-        port_str = self._prompt("Порт [8888]: ") or "8888"
-        try:
-            port = int(port_str)
-        except:
-            port = 8888
-        
-        with self.console.status(f"[cyan]Подключение к {ip}:{port}...[/cyan]"):
-            success = self.node.transport.connect_to(ip, port)
-        
-        if success:
-            self._show_notification(f"✓ Подключено к {ip}:{port}")
-        else:
-            self._show_notification("✗ Не удалось подключиться")
-        
-        self._prompt("\nНажмите Enter...")
-    
-    def _action_disconnect_peer(self):
-        """Отключение пира"""
-        self.console.clear()
-        self.console.print("[bold cyan]🔌 Отключение пира[/bold cyan]\n")
-        
-        with self._lock:
-            peers = self.state.peers
-        
-        if not peers:
-            self.console.print("[yellow]Нет подключенных пиров[/yellow]")
-            self._prompt("\nНажмите Enter...")
-            return
-        
-        for i, peer in enumerate(peers[:10], 1):
-            print(f"  {i}. {peer['address'][:30]}...")
-        
-        choice = self._prompt("\nНомер пира: ")
-        
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(peers):
-                addr = peers[idx]['address']
-                self._show_notification(f"Отключение {addr[:20]}...")
-        
-        self._prompt("\nНажмите Enter...")
-    
-    def _action_broadcast(self):
-        """Широковещательная рассылка"""
-        self.console.clear()
-        self.console.print("[bold cyan]📢 Широковещательная рассылка[/bold cyan]\n")
-        
-        message = self._prompt("Сообщение: ")
-        if message:
-            with self.console.status("[cyan]Рассылка...[/cyan]"):
-                sent = self.node.transport.broadcast({
-                    'type': 'broadcast',
-                    'text': message,
-                    'from': self.node.address
-                })
-            
-            self._show_notification(f"✓ Рассылка: {sent} пиров")
-        
-        self._prompt("\nНажмите Enter...")
-    
-    def _action_new_chat(self):
-        """Новый чат"""
-        self.console.clear()
-        self.console.print("[bold cyan]💬 Новый диалог[/bold cyan]\n")
-        
-        addr = self._prompt("Адрес контакта: ")
-        if addr:
-            self.state.selected_contact = addr
-            self._show_notification(f"Выбран контакт: {addr[:20]}...")
-    
-    def _force_refresh(self):
-        """Обновление"""
-        self._update_messages()
-        self._update_peers()
-        self._show_notification("✓ Данные обновлены")
-    
-    def _simple_chat(self):
-        """Простой чат"""
-        to = input("\nКому (адрес): ").strip()
-        if not to:
-            return
-        
-        print(f"\n--- Чат с {to[:20]}... ---")
-        try:
-            while True:
-                msg = input("> ").strip()
-                if not msg:
-                    break
-                msg_id = self.node.send_message(to, msg)
-                print(f"  ✓ {msg_id[:16]}..." if msg_id else "  ✗ Ошибка")
-        except KeyboardInterrupt:
-            pass
-        print("---")
-    
-    def _prompt(self, text: str) -> str:
-        """Prompt"""
-        if HAS_PROMPT_TOOLKIT and self.console:
-            try:
-                return pt_prompt(text)
-            except:
-                pass
-        return input(text)
-    
-    def _print(self, *args, **kwargs):
-        """Print"""
-        if self.console:
-            self.console.print(*args, **kwargs)
-        else:
-            print(*args)
-    
-    def _log(self, message: str):
-        """Лог"""
-        self.state.logs.put(message)
+    def _stop_api(self):
+        """Остановка API сервера"""
+        if self.api_server:
+            # TODO: implement proper shutdown
+            self.api_server = None
     
     def _shutdown(self):
-        """Shutdown"""
-        self.state.running = False
+        """Полное завершение работы"""
+        if self.console:
+            self.console.print("\n[yellow]🛑 Завершение работы...[/yellow]")
+        
+        self._shutdown_node()
         
         if self.console:
-            self.console.clear()
-            self.console.print("[yellow]🛑 Завершение работы...[/yellow]")
-        
+            self.console.print("[green]✓ Узел остановлен[/green]")
+    
+    def _shutdown_node(self):
+        """Остановка узла"""
         if self.node:
             try:
                 self.node.stop()
-                if self.console:
-                    self.console.print("[green]✓ Узел остановлен[/green]")
-            except Exception as e:
-                if self.console:
-                    self.console.print(f"[red]Ошибка: {e}[/red]")
+            except:
+                pass
+            self.node = None
     
-    @staticmethod
-    def _human_size(size_bytes: int) -> str:
-        """Human readable size"""
-        if size_bytes == 0:
-            return "0B"
-        size_names = ["B", "KB", "MB", "GB"]
-        i = 0
-        while size_bytes >= 1024 and i < len(size_names) - 1:
-            size_bytes /= 1024
-            i += 1
-        return f"{size_bytes:.1f}{size_names[i]}"
+    def _get_contacts(self) -> List[str]:
+        """Получить список контактов из сообщений"""
+        if not self.node or not self.node.storage:
+            return []
+        
+        messages = self.node.storage.get_messages(self.node.address, limit=1000)
+        contacts = set()
+        
+        for msg in messages:
+            if msg.get('from') and msg['from'] != self.node.address:
+                contacts.add(msg['from'])
+            if msg.get('to') and msg['to'] != self.node.address:
+                contacts.add(msg['to'])
+        
+        return sorted(list(contacts))
     
+    # Команды для одиночного режима
     def _cmd_send(self, args):
-        """Команда send"""
+        """Отправка сообщения в одиночном режиме"""
         message = ' '.join(args.message) if isinstance(args.message, list) else args.message
-        
-        if not self.node:
-            self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
-            self.node.start()
-        
         msg_id = self.node.send_message(args.to, message)
-        print(f"✅ Отправлено! ID: {msg_id}" if msg_id else "❌ Ошибка")
-        self.node.stop()
+        print(f"✓ Отправлено: {msg_id[:16]}..." if msg_id else "✗ Ошибка")
     
     def _cmd_status(self, args):
-        """Команда status"""
-        if not self.node:
-            self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
-            self.node.start()
-        
-        try:
-            status = self.node.get_status()
-            storage = self.node.storage.get_stats()
-            
-            print(f"Адрес: {self.node.address}")
-            print(f"Пиры: {len(self.node.transport.get_peers())}")
-            print(f"Сообщений: {storage.get('messages', 0)}")
-            print(f"Непрочитанных: {storage.get('messages_unread', 0)}")
-            print(f"БД: {storage.get('db_size_mb', 0):.1f} MB")
-        except Exception as e:
-            print(f"Ошибка: {e}")
-        
-        self.node.stop()
+        """Статус в одиночном режиме"""
+        status = self.node.get_status()
+        print(f"Адрес: {self.node.address}")
+        print(f"Пиры: {len(self.node.transport.get_peers())}")
+        print(f"Статус: {'Работает' if self.node.running else 'Остановлен'}")
     
     def _cmd_peers(self, args):
-        """Команда peers"""
-        if not self.node:
-            self.node = MurnetNode(data_dir=args.data_dir, port=args.port)
-            self.node.start()
-        
+        """Управление пирами в одиночном режиме"""
         if args.connect:
-            try:
-                ip, port = args.connect.rsplit(":", 1)
-                port = int(port)
-                success = self.node.transport.connect_to(ip, port)
-                print(f"{'✅' if success else '❌'} Подключение к {args.connect}")
-            except Exception as e:
-                print(f"❌ Ошибка: {e}")
+            ip, port = args.connect.rsplit(":", 1)
+            success = self.node.transport.connect_to(ip, int(port))
+            print(f"{'✓' if success else '✗'} Подключение к {args.connect}")
         elif args.list:
             peers = self.node.transport.get_peers()
-            print(f"Пиры ({len(peers)}):")
             for p in peers:
-                status = "🟢" if p.get('is_active') else "🔴"
-                print(f"  {status} {p['address'][:20]}... @ {p['ip']}:{p['port']}")
-        
-        self.node.stop()
+                print(f"  {p['address'][:30]}... @ {p['ip']}:{p['port']}")
 
 
 def main():
